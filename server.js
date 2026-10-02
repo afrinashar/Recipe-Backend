@@ -5,7 +5,7 @@ import express from 'express'
 import jwt from 'jsonwebtoken'
 import mongoose from 'mongoose'
 import rateLimit from 'express-rate-limit'
-import { dirname, resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mkdirSync, unlink } from 'node:fs'
 import { promisify } from 'node:util'
@@ -19,8 +19,11 @@ const port = process.env.PORT || 5000
 const jwtSecret = process.env.JWT_SECRET || 'development-secret-change-me'
 const mongoUri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/mise-en-place'
 let mongoConnectionError = null
+let mongoConnectionPromise = null
 const serverDirectory = dirname(fileURLToPath(import.meta.url))
-const uploadsDirectory = resolve(serverDirectory, 'uploads', 'cooking-results')
+const uploadsDirectory = process.env.VERCEL
+  ? resolve('/tmp', 'cooking-results')
+  : resolve(serverDirectory, 'uploads', 'cooking-results')
 mkdirSync(uploadsDirectory, { recursive: true })
 const deleteFile = promisify(unlink)
 const cookingPhotoUpload = multer({
@@ -38,7 +41,13 @@ const cookingPhotoUpload = multer({
 app.use(cors())
 app.use(express.json())
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false }))
-app.use('/uploads', express.static(resolve(serverDirectory, 'uploads'), { maxAge: '1d' }))
+app.get('/uploads/cooking-results/:filename', (request, response, next) => {
+  const filename = request.params.filename
+  if (filename !== basename(filename)) return response.status(400).json({ message: 'Invalid image path' })
+  response.sendFile(resolve(uploadsDirectory, filename), (error) => {
+    if (error && !response.headersSent) next(error)
+  })
+})
 
 const recipeSchema = new mongoose.Schema({
   title: { type: String, required: true },
@@ -94,17 +103,39 @@ const auth = (request, response, next) => {
   if (!token) return response.status(401).json({ message: 'Authentication required' })
   try { request.user = jwt.verify(token, jwtSecret); next() } catch { response.status(401).json({ message: 'Invalid or expired token' }) }
 }
-const requireDatabase = (_request, response, next) => mongoose.connection.readyState === 1 ? next() : response.status(503).json({ message: 'MongoDB is not connected' })
+const ensureMongoConnected = () => {
+  if (mongoose.connection.readyState === 1) return Promise.resolve()
+  if (!mongoConnectionPromise) {
+    mongoConnectionPromise = mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 8000 })
+      .then(() => { mongoConnectionError = null })
+      .catch((error) => {
+        mongoConnectionError = error.code || error.name || 'ConnectionError'
+        mongoConnectionPromise = null
+        throw error
+      })
+  }
+  return mongoConnectionPromise
+}
+const requireDatabase = async (_request, response, next) => {
+  try {
+    await ensureMongoConnected()
+    next()
+  } catch {
+    response.status(503).json({ message: 'MongoDB is not connected', databaseError: mongoConnectionError })
+  }
+}
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const parsePage = (value) => Math.max(1, Number.parseInt(value, 10) || 1)
 const parseLimit = (value) => Math.min(50, Math.max(1, Number.parseInt(value, 10) || 12))
 
-app.get('/api/health', (_request, response) => response.json({
-  status: 'ok',
-  database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-  databaseError: mongoConnectionError,
-  databaseConfig: process.env.MONGO_URI ? 'MONGO_URI' : 'local default',
-}))
+app.get('/api/health', async (_request, response) => {
+  try {
+    await ensureMongoConnected()
+    response.json({ status: 'ok', database: 'connected', databaseConfig: process.env.MONGO_URI ? 'MONGO_URI' : 'local default' })
+  } catch {
+    response.status(503).json({ status: 'error', database: 'disconnected', databaseError: mongoConnectionError, databaseConfig: process.env.MONGO_URI ? 'MONGO_URI' : 'local default' })
+  }
+})
 app.get('/api/recipes', requireDatabase, async (request, response) => {
   const { search, category, cuisine, difficulty, status = 'published' } = request.query
   const page = parsePage(request.query.page)
@@ -192,15 +223,6 @@ app.put('/api/profile', auth, requireDatabase, async (request, response) => {
   response.json(user)
 })
 
-mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 8000 })
-  .then(() => {
-    mongoConnectionError = null
-    console.log('MongoDB connected')
-  })
-  .catch((error) => {
-    mongoConnectionError = error.code || error.name || 'ConnectionError'
-    console.error(`MongoDB connection failed (${mongoConnectionError}). Check server/.env and confirm MongoDB is running or the Atlas IP is allowlisted.`)
-  })
 mongoose.connection.on('error', (error) => {
   mongoConnectionError = error.code || error.name || 'ConnectionError'
   console.error(`MongoDB connection error (${mongoConnectionError})`)
@@ -214,4 +236,7 @@ app.use((error, _request, response, _next) => {
   console.error(error)
   response.status(500).json({ message: 'Something went wrong on the server' })
 })
-app.listen(port, () => console.log(`API listening on http://localhost:${port}`))
+if (!process.env.VERCEL) {
+  app.listen(port, () => console.log(`API listening on http://localhost:${port}`))
+}
+export default app
